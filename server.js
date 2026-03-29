@@ -50,7 +50,7 @@ app.use(express.static("docs"));
 -------------------------------- */
 
 app.get("/", (req,res)=>{
-    res.send("K2 Connect API Running");
+    res.send("sarahapay API Running");
 });
 
 
