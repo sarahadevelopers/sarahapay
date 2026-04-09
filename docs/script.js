@@ -11,15 +11,13 @@ async function handlePayment() {
         return;
     }
 
-    // UI feedback
     btn.disabled = true;
     btn.innerText = "Processing...";
-
     status.style.color = "blue";
     status.innerText = "Requesting M-Pesa prompt...";
 
     try {
-        // Use the full backend URL
+        // ✅ CORRECT: Use your Render backend URL
         const API_URL = "https://sarahapay.onrender.com/api/pay";
         
         const response = await fetch(API_URL, {
@@ -39,10 +37,6 @@ async function handlePayment() {
         if (response.ok) {
             status.style.color = "green";
             status.innerText = "STK Push sent. Check your phone.";
-            // Optional: clear form
-            // document.getElementById("name").value = "";
-            // document.getElementById("phone").value = "";
-            // document.getElementById("amount").value = "";
         } else {
             status.style.color = "red";
             status.innerText = data.error || data.details || "Payment failed";
