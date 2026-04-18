@@ -207,7 +207,20 @@ app.get("/api/transactions", async (req,res)=>{
     }
 });
 
-
+/* -------------------------------
+   7.5 Get Single Transaction by ID
+-------------------------------- */
+app.get("/api/transaction/:id", async (req,res)=>{
+    try{
+        const transaction = await Transaction.findById(req.params.id);
+        if(!transaction){
+            return res.status(404).json({ error:"Transaction not found" });
+        }
+        res.json(transaction);
+    }catch(error){
+        res.status(500).json({ error:"Failed to fetch transaction" });
+    }
+});
 /* -------------------------------
    8. Payment Callback (CRASH‑PROOF)
 -------------------------------- */
