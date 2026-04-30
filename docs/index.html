@@ -78,9 +78,9 @@ required
 <input 
 type="tel"
 id="phone"
-placeholder="Phone (e.g. 0712345678)"
-pattern="^(07|01|2547|2541)\d{8}$"
-title="Enter a valid Kenyan phone number"
+placeholder="Phone (e.g. 0712345678, 0111234567, or 254111234567)"
+pattern="^(07[0-9]{8}|011[0-9]{7}|2547[0-9]{8}|25411[0-9]{7})$"
+title="Enter a valid Safaricom number: 07XXXXXXXX (10 digits), 011XXXXXXX (10 digits), 2547XXXXXXXX (12 digits), or 25411XXXXXXX (12 digits)"
 required
 >
 
