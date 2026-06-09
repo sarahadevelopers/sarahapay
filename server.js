@@ -26,8 +26,8 @@ const transactionSchema = new mongoose.Schema({
     status: { type: String, default: "PENDING" },
     checkout_id: String,
     mpesa_receipt: String,
-    retryCount: { type: Number, default: 0 },        // number of retries for this transaction
-    lastRetryAt: { type: Date, default: null },      // timestamp of last retry attempt
+    retryCount: { type: Number, default: 0 },        // number of retries for this phone
+    lastRetryAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -48,7 +48,7 @@ app.get("/", (req, res) => {
 });
 
 /* -------------------------------
-   5. OAuth Token (with timeout)
+   5. OAuth Token (unchanged)
 -------------------------------- */
 async function getAccessToken() {
     try {
@@ -76,16 +76,14 @@ async function getAccessToken() {
 }
 
 /* -------------------------------
-   6. Helper: Initiate STK Push (reusable)
+   6. Helper: Initiate STK Push
 -------------------------------- */
 async function initiateStkPush(name, phone, amount, retryCount = 0) {
-    // Normalize phone number
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
         .replace(/^0/, '254');
 
-    // Split full name
     const names = name.trim().split(" ");
     const firstName = names[0];
     const lastName = names.slice(1).join(" ") || "Customer";
@@ -141,7 +139,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 }
 
 /* -------------------------------
-   7. Initiate Payment (with retry logic)
+   7. Initiate Payment (with 30‑second timeout & retry logic)
 -------------------------------- */
 app.post("/api/pay", async (req, res) => {
     try {
@@ -159,15 +157,16 @@ app.post("/api/pay", async (req, res) => {
         const lastTx = await Transaction.findOne({ phone: formattedPhone })
             .sort({ createdAt: -1 });
 
-        // If there is a pending transaction older than 3 minutes, mark it as FAILED (cleanup)
+        // ---------- 30‑second timeout for pending transactions ----------
         if (lastTx && lastTx.status === "PENDING") {
-            const minutesSince = (Date.now() - new Date(lastTx.createdAt).getTime()) / 60000;
-            if (minutesSince > 3) {
+            const secondsSince = (Date.now() - new Date(lastTx.createdAt).getTime()) / 1000;
+            if (secondsSince > 30) {
+                // Mark stale pending as FAILED
                 await Transaction.updateOne(
                     { _id: lastTx._id },
                     { status: "FAILED" }
                 );
-                console.log(`Auto-cleaned stale pending transaction ${lastTx._id}`);
+                console.log(`Auto‑cleaned stale pending transaction ${lastTx._id} after 30s`);
             } else {
                 // Still fresh pending – block new attempt
                 return res.status(409).json({
@@ -176,19 +175,19 @@ app.post("/api/pay", async (req, res) => {
             }
         }
 
-        // Check retry limits for failed transactions
+        // ---------- Retry limit handling (max 5 attempts) ----------
         if (lastTx && (lastTx.status === "FAILED" || lastTx.status === "CANCELLED")) {
-            const minutesSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 60000;
             const retryCount = lastTx.retryCount || 0;
+            const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
 
             if (retryCount >= 5) {
-                // After 5 failures, enforce a 3-minute cooldown
-                if (minutesSinceLast < 3) {
+                if (secondsSinceLast < 30) {
+                    // Short cooldown after 5 failures
                     return res.status(429).json({
-                        error: `Too many failed attempts. Please wait ${Math.ceil(3 - minutesSinceLast)} minute(s) before trying again.`
+                        error: `Too many failed attempts (${retryCount}). Please wait ${Math.ceil(30 - secondsSinceLast)} seconds before trying again.`
                     });
                 } else {
-                    // Cooldown passed – reset retry count for the next attempt
+                    // Cooldown passed – reset retry count
                     await Transaction.updateOne({ _id: lastTx._id }, { retryCount: 0 });
                 }
             }
@@ -211,7 +210,7 @@ app.post("/api/pay", async (req, res) => {
 });
 
 /* -------------------------------
-   8. Retry Payment Endpoint
+   8. Retry Payment Endpoint (immediate retry after failure/cancellation)
 -------------------------------- */
 app.post("/api/retry-payment", async (req, res) => {
     try {
@@ -225,7 +224,7 @@ app.post("/api/retry-payment", async (req, res) => {
             .replace(/^\+/, '')
             .replace(/^0/, '254');
 
-        // Find the most recent non-successful transaction for this phone
+        // Find the most recent non‑successful transaction for this phone
         const lastTx = await Transaction.findOne({
             phone: formattedPhone,
             status: { $in: ["PENDING", "FAILED", "CANCELLED"] }
@@ -236,21 +235,20 @@ app.post("/api/retry-payment", async (req, res) => {
         }
 
         const retryCount = lastTx.retryCount || 0;
-        const minutesSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 60000;
+        const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
 
-        // Check retry limits
+        // Retry limit check
         if (retryCount >= 5) {
-            if (minutesSinceLast < 3) {
+            if (secondsSinceLast < 30) {
                 return res.status(429).json({
-                    error: `Retry limit reached. Please wait ${Math.ceil(3 - minutesSinceLast)} minute(s) before trying again.`
+                    error: `Retry limit reached (${retryCount}). Please wait ${Math.ceil(30 - secondsSinceLast)} seconds before trying again.`
                 });
             } else {
-                // Cooldown passed – reset retry count
                 await Transaction.updateOne({ _id: lastTx._id }, { retryCount: 0 });
             }
         }
 
-        // Mark the old transaction as FAILED (so it's no longer pending)
+        // Mark old transaction as FAILED so it's no longer pending
         await Transaction.updateOne(
             { _id: lastTx._id },
             { status: "FAILED", lastRetryAt: new Date() }
@@ -280,7 +278,7 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 /* -------------------------------
-   9. Fetch Transactions
+   9. Fetch Transactions (unchanged)
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -292,7 +290,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 /* -------------------------------
-   10. Get Single Transaction by ID
+   10. Get Single Transaction by ID (unchanged)
 -------------------------------- */
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -307,7 +305,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   11. Payment Callback (CRASH‑PROOF)
+   11. Payment Callback (unchanged)
 -------------------------------- */
 app.post("/callback", async (req, res) => {
     try {

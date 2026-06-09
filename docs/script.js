@@ -34,24 +34,17 @@ async function retryPayment(phone) {
 
         if (response.ok) {
             showStatus(data.message || "Retry initiated. Check your phone for M-PESA prompt.", "success");
-            // Remove retry button if present
             const rb = document.getElementById("retryBtn");
             if (rb) rb.remove();
-            // Re-enable pay button? User may want to pay again, but we keep it enabled.
             setPayButton(false, "Pay Now");
         } else if (response.status === 429) {
-            // Cooldown period – show wait time
+            // Cooldown period – show wait time (in seconds)
             const errorMsg = data.error || "Too many failed attempts. Please wait.";
             showStatus(errorMsg, "error");
-            // Extract minutes from error message (e.g., "wait 3 minute(s)")
-            const match = errorMsg.match(/(\d+)\s*minute/);
-            if (match && match[1]) {
-                const waitMinutes = parseInt(match[1]);
-                startCooldownTimer(waitMinutes * 60, phone);
-            } else {
-                // Fallback: try again after 3 minutes
-                startCooldownTimer(180, phone);
-            }
+            // Extract seconds from error message (e.g., "wait 30 seconds")
+            const match = errorMsg.match(/(\d+)\s*second/);
+            const waitSeconds = match ? parseInt(match[1]) : 30;
+            startCooldownTimer(waitSeconds, phone);
         } else {
             showStatus(data.error || "Retry failed. Try again later.", "error");
             if (retryBtn) {
@@ -69,27 +62,16 @@ async function retryPayment(phone) {
     }
 }
 
-// Countdown timer for cooldown period
+// Countdown timer for cooldown period (in seconds)
 function startCooldownTimer(seconds, phone) {
     let remaining = seconds;
     const timerInterval = setInterval(() => {
         if (remaining <= 0) {
             clearInterval(timerInterval);
             showStatus("You can now retry again.", "blue");
-            const retryBtn = document.getElementById("retryBtn");
-            if (retryBtn) {
-                retryBtn.disabled = false;
-                retryBtn.innerText = "Retry Payment";
-                // Re-attach event listener (in case it was removed)
-                retryBtn.onclick = () => retryPayment(phone);
-            } else {
-                // Re-create retry button if missing
-                offerRetryButton(phone);
-            }
+            offerRetryButton(phone);
         } else {
-            const minutes = Math.floor(remaining / 60);
-            const secs = remaining % 60;
-            showStatus(`Too many failed attempts. Please wait ${minutes}:${secs < 10 ? '0'+secs : secs} before retrying.`, "error");
+            showStatus(`Too many failed attempts. Please wait ${remaining} seconds before retrying.`, "error");
             remaining--;
         }
     }, 1000);
@@ -109,7 +91,6 @@ function offerRetryButton(phone) {
         retryBtn.style.borderRadius = "5px";
         retryBtn.style.cursor = "pointer";
         retryBtn.onclick = () => retryPayment(phone);
-        // Insert after pay button
         const payBtn = document.getElementById("payBtn");
         if (payBtn && payBtn.parentNode) {
             payBtn.parentNode.insertBefore(retryBtn, payBtn.nextSibling);
@@ -124,9 +105,8 @@ function offerRetryButton(phone) {
     }
 }
 
-// Main payment function (unchanged except integration with retry)
+// Main payment function
 async function handlePayment() {
-    const btn = document.getElementById("payBtn");
     const name = document.getElementById("name").value;
     const phone = document.getElementById("phone").value;
     const amount = document.getElementById("amount").value;
@@ -150,24 +130,21 @@ async function handlePayment() {
 
         if (response.ok) {
             showStatus("STK Push sent. Check your phone.", "success");
-            // Remove any existing retry button
             const rb = document.getElementById("retryBtn");
             if (rb) rb.remove();
         } else {
-            // Payment failed – show error and offer retry
             const errorMsg = data.error || data.details || "Payment failed";
             showStatus(errorMsg, "error");
-            // Offer retry button for failures (except if it's a pending conflict? we still offer)
+
             if (response.status === 409) {
                 showStatus("You already have a pending payment. Check your phone or wait a few minutes.", "error");
+                // Optionally offer retry after a short delay (e.g., 30 seconds)
+                startCooldownTimer(30, phone);
             } else if (response.status === 429) {
-                // Cooldown – start timer and show retry button after cooldown
-                const waitMatch = errorMsg.match(/(\d+)\s*minute/);
-                if (waitMatch && waitMatch[1]) {
-                    startCooldownTimer(parseInt(waitMatch[1]) * 60, phone);
-                } else {
-                    startCooldownTimer(180, phone); // default 3 min
-                }
+                // Extract seconds from error message (e.g., "wait 30 seconds")
+                const waitMatch = errorMsg.match(/(\d+)\s*second/);
+                const waitSeconds = waitMatch ? parseInt(waitMatch[1]) : 30;
+                startCooldownTimer(waitSeconds, phone);
             } else {
                 // Generic failure – offer retry immediately
                 offerRetryButton(phone);
@@ -181,6 +158,3 @@ async function handlePayment() {
         setPayButton(false, "Pay Now");
     }
 }
-
-// Ensure retry button is removed when a new payment is attempted (optional)
-// Also ensure that when user clicks pay again, any ongoing timer is reset? Not needed.
