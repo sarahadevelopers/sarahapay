@@ -5,6 +5,7 @@ const axios = require('axios');
 const cors = require('cors');
 const qs = require('qs');
 const mongoose = require('mongoose');
+const rateLimit = require('express-rate-limit'); // <-- NEW
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -26,7 +27,7 @@ const transactionSchema = new mongoose.Schema({
     status: { type: String, default: "PENDING" },
     checkout_id: String,
     mpesa_receipt: String,
-    retryCount: { type: Number, default: 0 },        // number of retries for this phone
+    retryCount: { type: Number, default: 0 },
     lastRetryAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 });
@@ -40,6 +41,69 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static("docs"));
 
+// ---------- RATE LIMITING & BLOCKING (NEW) ----------
+// In-memory store for tracking violations and blocks
+const violationStore = new Map(); // IP => { count, firstViolationTime, blockUntil }
+
+// Cleanup expired entries every minute
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, data] of violationStore.entries()) {
+        if (data.blockUntil && data.blockUntil < now) {
+            violationStore.delete(ip);
+        } else if (!data.blockUntil && (now - data.firstViolationTime) > 3600000) {
+            // If no block and violation is older than 1 hour, remove it
+            violationStore.delete(ip);
+        }
+    }
+}, 60000);
+
+// Middleware to check if IP is currently blocked
+const checkBlocked = (req, res, next) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    const data = violationStore.get(ip);
+    if (data && data.blockUntil && data.blockUntil > now) {
+        return res.status(403).json({
+            error: `Your IP is temporarily blocked due to excessive failed attempts. Try again after ${Math.ceil((data.blockUntil - now) / 60000)} minutes.`
+        });
+    }
+    next();
+};
+
+// Primary rate limiter: 3 requests per 5 minutes
+const paymentLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minutes
+    max: 3,
+    message: { error: "Too many payment requests from this IP. Please wait 5 minutes." },
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+        // On rate limit violation, track it
+        const ip = req.ip || req.connection.remoteAddress;
+        const now = Date.now();
+        const data = violationStore.get(ip) || { count: 0, firstViolationTime: now, blockUntil: null };
+        data.count += 1;
+        if (data.count >= 3) { // after 3 violations within the hour
+            // Block for 1 hour
+            data.blockUntil = now + 3600000;
+            violationStore.set(ip, data);
+            res.status(429).json({
+                error: "Too many failed payment attempts. Your IP has been blocked for 1 hour."
+            });
+        } else {
+            violationStore.set(ip, data);
+            res.status(429).json({
+                error: "Too many payment requests from this IP. Please wait 5 minutes."
+            });
+        }
+    }
+});
+
+// Apply blocking and rate limiting to payment endpoints
+app.use('/api/pay', checkBlocked, paymentLimiter);
+app.use('/api/retry-payment', checkBlocked, paymentLimiter);
+
 /* -------------------------------
    4. Root Route
 -------------------------------- */
@@ -48,7 +112,7 @@ app.get("/", (req, res) => {
 });
 
 /* -------------------------------
-   5. OAuth Token (unchanged)
+   5. OAuth Token
 -------------------------------- */
 async function getAccessToken() {
     try {
@@ -161,14 +225,12 @@ app.post("/api/pay", async (req, res) => {
         if (lastTx && lastTx.status === "PENDING") {
             const secondsSince = (Date.now() - new Date(lastTx.createdAt).getTime()) / 1000;
             if (secondsSince > 30) {
-                // Mark stale pending as FAILED
                 await Transaction.updateOne(
                     { _id: lastTx._id },
                     { status: "FAILED" }
                 );
                 console.log(`Auto‑cleaned stale pending transaction ${lastTx._id} after 30s`);
             } else {
-                // Still fresh pending – block new attempt
                 return res.status(409).json({
                     error: "You already have a pending payment. Please wait or check your phone."
                 });
@@ -182,18 +244,15 @@ app.post("/api/pay", async (req, res) => {
 
             if (retryCount >= 5) {
                 if (secondsSinceLast < 30) {
-                    // Short cooldown after 5 failures
                     return res.status(429).json({
                         error: `Too many failed attempts (${retryCount}). Please wait ${Math.ceil(30 - secondsSinceLast)} seconds before trying again.`
                     });
                 } else {
-                    // Cooldown passed – reset retry count
                     await Transaction.updateOne({ _id: lastTx._id }, { retryCount: 0 });
                 }
             }
         }
 
-        // Initiate a new STK push
         const tx = await initiateStkPush(name, formattedPhone, amount, lastTx?.retryCount || 0);
         res.status(201).json({
             message: "STK Push Sent",
@@ -210,7 +269,7 @@ app.post("/api/pay", async (req, res) => {
 });
 
 /* -------------------------------
-   8. Retry Payment Endpoint (immediate retry after failure/cancellation)
+   8. Retry Payment Endpoint
 -------------------------------- */
 app.post("/api/retry-payment", async (req, res) => {
     try {
@@ -224,7 +283,6 @@ app.post("/api/retry-payment", async (req, res) => {
             .replace(/^\+/, '')
             .replace(/^0/, '254');
 
-        // Find the most recent non‑successful transaction for this phone
         const lastTx = await Transaction.findOne({
             phone: formattedPhone,
             status: { $in: ["PENDING", "FAILED", "CANCELLED"] }
@@ -237,7 +295,6 @@ app.post("/api/retry-payment", async (req, res) => {
         const retryCount = lastTx.retryCount || 0;
         const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
 
-        // Retry limit check
         if (retryCount >= 5) {
             if (secondsSinceLast < 30) {
                 return res.status(429).json({
@@ -248,13 +305,11 @@ app.post("/api/retry-payment", async (req, res) => {
             }
         }
 
-        // Mark old transaction as FAILED so it's no longer pending
         await Transaction.updateOne(
             { _id: lastTx._id },
             { status: "FAILED", lastRetryAt: new Date() }
         );
 
-        // Initiate a new STK push with increased retry count
         const newTx = await initiateStkPush(
             lastTx.name,
             formattedPhone,
@@ -278,7 +333,7 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 /* -------------------------------
-   9. Fetch Transactions (unchanged)
+   9. Fetch Transactions
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -290,7 +345,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 /* -------------------------------
-   10. Get Single Transaction by ID (unchanged)
+   10. Get Single Transaction by ID
 -------------------------------- */
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -305,7 +360,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   11. Payment Callback (unchanged)
+   11. Payment Callback
 -------------------------------- */
 app.post("/callback", async (req, res) => {
     try {
