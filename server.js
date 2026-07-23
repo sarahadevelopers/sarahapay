@@ -5,7 +5,7 @@ const axios = require('axios');
 const cors = require('cors');
 const qs = require('qs');
 const mongoose = require('mongoose');
-const rateLimit = require('express-rate-limit'); // <-- NEW
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -35,13 +35,116 @@ const transactionSchema = new mongoose.Schema({
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
 /* -------------------------------
-   3. Middleware
+   3. Middleware (CORS, JSON, Static) – with allowed origins
 -------------------------------- */
-app.use(cors());
+
+// ---------- Allowed domains (CORS) ----------
+// ---------- Allowed domains (CORS) ----------
+const allowedOrigins = [
+    'https://bingwasoko.co.ke',
+    'https://www.bingwasoko.co.ke',
+    'https://datasokoni.com',
+    'https://www.datasokoni.com',
+    'https://fineescorts.co.ke',
+    'https://www.fineescorts.co.ke',
+    'https://sarahadevelopers.github.io', // GitHub Pages
+    'http://localhost:3000'               // local testing
+];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true
+}));
+
+
+
 app.use(express.json());
 app.use(express.static("docs"));
 
-// ---------- RATE LIMITING & BLOCKING (NEW) ----------
+// ---------- SHARED SECRET CHECK (for both payment endpoints) ----------
+const checkSecret = (req, res, next) => {
+    const secret = req.headers['x-api-secret'];
+    if (secret !== process.env.API_SECRET) {
+        return res.status(403).json({ error: "Unauthorized" });
+    }
+    next();
+};
+
+// ---------- reCAPTCHA VERIFICATION (for payment endpoints) ----------
+const verifyRecaptcha = async (req, res, next) => {
+    const token = req.headers['x-recaptcha-token'];
+    if (!token) {
+        return res.status(400).json({ error: "Missing reCAPTCHA token" });
+    }
+
+    try {
+        const verification = await axios.post(
+            'https://www.google.com/recaptcha/api/siteverify',
+            null,
+            {
+                params: {
+                    secret: process.env.RECAPTCHA_SECRET,
+                    response: token
+                },
+                timeout: 5000
+            }
+        );
+
+        const { success, score } = verification.data;
+        if (!success || score < 0.5) {
+            console.log(`reCAPTCHA failed: success=${success}, score=${score}`);
+            return res.status(403).json({ error: "Bot detected. Please try again." });
+        }
+
+        next();
+    } catch (error) {
+        console.error("reCAPTCHA verification error:", error);
+        return res.status(500).json({ error: "CAPTCHA verification failed" });
+    }
+};
+
+// ---------- GLOBAL RATE LIMIT (all IPs combined) ----------
+let globalRequestCount = 0;
+let globalWindowStart = Date.now();
+const GLOBAL_MAX = 50; // max requests per minute across all IPs
+const GLOBAL_WINDOW = 60 * 1000; // 1 minute
+
+const globalRateLimit = (req, res, next) => {
+    const now = Date.now();
+    if (now - globalWindowStart > GLOBAL_WINDOW) {
+        // Reset window
+        globalRequestCount = 0;
+        globalWindowStart = now;
+    }
+    globalRequestCount++;
+    if (globalRequestCount > GLOBAL_MAX) {
+        return res.status(429).json({ error: "Global request limit reached. Please try again later." });
+    }
+    next();
+};
+
+// ---------- Apply middleware to payment endpoints in the correct order ----------
+// 1. Secret check
+app.use('/api/pay', checkSecret);
+app.use('/api/retry-payment', checkSecret);
+
+// 2. reCAPTCHA verification
+app.use('/api/pay', verifyRecaptcha);
+app.use('/api/retry-payment', verifyRecaptcha);
+
+// 3. Global rate limit (all IPs combined)
+app.use('/api/pay', globalRateLimit);
+app.use('/api/retry-payment', globalRateLimit);
+
+// ---------- RATE LIMITING & IP BLOCKING (per‑IP) ----------
 // In-memory store for tracking violations and blocks
 const violationStore = new Map(); // IP => { count, firstViolationTime, blockUntil }
 
@@ -71,7 +174,7 @@ const checkBlocked = (req, res, next) => {
     next();
 };
 
-// Primary rate limiter: 3 requests per 5 minutes
+// Primary rate limiter: 3 requests per 5 minutes (per‑IP)
 const paymentLimiter = rateLimit({
     windowMs: 5 * 60 * 1000, // 5 minutes
     max: 3,
@@ -100,7 +203,7 @@ const paymentLimiter = rateLimit({
     }
 });
 
-// Apply blocking and rate limiting to payment endpoints
+// 4. Per‑IP rate limit + blocking (after global rate limit)
 app.use('/api/pay', checkBlocked, paymentLimiter);
 app.use('/api/retry-payment', checkBlocked, paymentLimiter);
 

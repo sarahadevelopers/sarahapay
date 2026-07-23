@@ -14,6 +14,12 @@ function setPayButton(disabled, text = null) {
     if (text !== null) btn.innerText = text;
 }
 
+// ---------- Shared secret (must match API_SECRET in Render) ----------
+const API_SECRET = "103e07b75c0b3d874cd4376dd0e095729f66d4f26803361aa087df169acc4ac4";
+
+// ---------- reCAPTCHA site key (from Google) ----------
+const RECAPTCHA_SITE_KEY = "6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5";
+
 // Retry payment using /api/retry-payment endpoint
 async function retryPayment(phone) {
     const retryBtn = document.getElementById("retryBtn");
@@ -27,7 +33,10 @@ async function retryPayment(phone) {
         const API_RETRY_URL = "https://sarahapay.onrender.com/api/retry-payment";
         const response = await fetch(API_RETRY_URL, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Secret": API_SECRET
+            },
             body: JSON.stringify({ phone: phone })
         });
         const data = await response.json();
@@ -38,10 +47,8 @@ async function retryPayment(phone) {
             if (rb) rb.remove();
             setPayButton(false, "Pay Now");
         } else if (response.status === 429) {
-            // Cooldown period – show wait time (in seconds)
             const errorMsg = data.error || "Too many failed attempts. Please wait.";
             showStatus(errorMsg, "error");
-            // Extract seconds from error message (e.g., "wait 30 seconds")
             const match = errorMsg.match(/(\d+)\s*second/);
             const waitSeconds = match ? parseInt(match[1]) : 30;
             startCooldownTimer(waitSeconds, phone);
@@ -105,7 +112,7 @@ function offerRetryButton(phone) {
     }
 }
 
-// Main payment function
+// Main payment function (with reCAPTCHA)
 async function handlePayment() {
     const name = document.getElementById("name").value;
     const phone = document.getElementById("phone").value;
@@ -120,10 +127,27 @@ async function handlePayment() {
     showStatus("Requesting M-Pesa prompt...", "blue");
 
     try {
+        // ---------- Get reCAPTCHA token (invisible) ----------
+        let recaptchaToken = '';
+        try {
+            // Execute reCAPTCHA and get token
+            recaptchaToken = await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action: 'payment' });
+        } catch (captchaErr) {
+            console.error("reCAPTCHA error:", captchaErr);
+            // If reCAPTCHA fails (e.g., script not loaded), we still proceed
+            // but the backend will reject if token is missing.
+            // Optionally, you can show a message and return.
+            // For production, you might want to block payment if CAPTCHA fails.
+        }
+
         const API_URL = "https://sarahapay.onrender.com/api/pay";
         const response = await fetch(API_URL, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Secret": API_SECRET,
+                "X-Recaptcha-Token": recaptchaToken   // <-- Add token header
+            },
             body: JSON.stringify({ name, phone, amount })
         });
         const data = await response.json();
@@ -138,15 +162,12 @@ async function handlePayment() {
 
             if (response.status === 409) {
                 showStatus("You already have a pending payment. Check your phone or wait a few minutes.", "error");
-                // Optionally offer retry after a short delay (e.g., 30 seconds)
                 startCooldownTimer(30, phone);
             } else if (response.status === 429) {
-                // Extract seconds from error message (e.g., "wait 30 seconds")
                 const waitMatch = errorMsg.match(/(\d+)\s*second/);
                 const waitSeconds = waitMatch ? parseInt(waitMatch[1]) : 30;
                 startCooldownTimer(waitSeconds, phone);
             } else {
-                // Generic failure – offer retry immediately
                 offerRetryButton(phone);
             }
         }
