@@ -3,9 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const qs = require('qs');
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -18,14 +18,14 @@ mongoose.connect(process.env.MONGO_URI)
     .catch(err => console.error("MongoDB Error:", err));
 
 /* -------------------------------
-   2. Transaction Schema (with retry fields)
+   2. Transaction Schema (unchanged)
 -------------------------------- */
 const transactionSchema = new mongoose.Schema({
     name: String,
     phone: String,
     amount: String,
     status: { type: String, default: "PENDING" },
-    checkout_id: String,
+    checkout_id: String,          // will store Lipana's checkoutRequestID or transactionId
     mpesa_receipt: String,
     retryCount: { type: Number, default: 0 },
     lastRetryAt: { type: Date, default: null },
@@ -37,9 +37,6 @@ const Transaction = mongoose.model("Transaction", transactionSchema);
 /* -------------------------------
    3. Middleware (CORS, JSON, Static) – with allowed origins
 -------------------------------- */
-
-// ---------- Allowed domains (CORS) ----------
-// ---------- Allowed domains (CORS) ----------
 const allowedOrigins = [
     'https://bingwasoko.co.ke',
     'https://www.bingwasoko.co.ke',
@@ -47,13 +44,12 @@ const allowedOrigins = [
     'https://www.datasokoni.com',
     'https://fineescorts.co.ke',
     'https://www.fineescorts.co.ke',
-    'https://sarahadevelopers.github.io', // GitHub Pages
-    'http://localhost:3000'               // local testing
+    'https://sarahadevelopers.github.io',
+    'http://localhost:3000'
 ];
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl)
         if (!origin) return callback(null, true);
         if (allowedOrigins.indexOf(origin) !== -1) {
             callback(null, true);
@@ -63,8 +59,6 @@ app.use(cors({
     },
     credentials: true
 }));
-
-
 
 app.use(express.json());
 app.use(express.static("docs"));
@@ -114,13 +108,12 @@ const verifyRecaptcha = async (req, res, next) => {
 // ---------- GLOBAL RATE LIMIT (all IPs combined) ----------
 let globalRequestCount = 0;
 let globalWindowStart = Date.now();
-const GLOBAL_MAX = 50; // max requests per minute across all IPs
-const GLOBAL_WINDOW = 60 * 1000; // 1 minute
+const GLOBAL_MAX = 50;
+const GLOBAL_WINDOW = 60 * 1000;
 
 const globalRateLimit = (req, res, next) => {
     const now = Date.now();
     if (now - globalWindowStart > GLOBAL_WINDOW) {
-        // Reset window
         globalRequestCount = 0;
         globalWindowStart = now;
     }
@@ -131,37 +124,28 @@ const globalRateLimit = (req, res, next) => {
     next();
 };
 
-// ---------- Apply middleware to payment endpoints in the correct order ----------
-// 1. Secret check
+// ---------- Apply middleware to payment endpoints ----------
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
-
-// 2. reCAPTCHA verification
 app.use('/api/pay', verifyRecaptcha);
 app.use('/api/retry-payment', verifyRecaptcha);
-
-// 3. Global rate limit (all IPs combined)
 app.use('/api/pay', globalRateLimit);
 app.use('/api/retry-payment', globalRateLimit);
 
 // ---------- RATE LIMITING & IP BLOCKING (per‑IP) ----------
-// In-memory store for tracking violations and blocks
-const violationStore = new Map(); // IP => { count, firstViolationTime, blockUntil }
+const violationStore = new Map();
 
-// Cleanup expired entries every minute
 setInterval(() => {
     const now = Date.now();
     for (const [ip, data] of violationStore.entries()) {
         if (data.blockUntil && data.blockUntil < now) {
             violationStore.delete(ip);
         } else if (!data.blockUntil && (now - data.firstViolationTime) > 3600000) {
-            // If no block and violation is older than 1 hour, remove it
             violationStore.delete(ip);
         }
     }
 }, 60000);
 
-// Middleware to check if IP is currently blocked
 const checkBlocked = (req, res, next) => {
     const ip = req.ip || req.connection.remoteAddress;
     const now = Date.now();
@@ -174,21 +158,18 @@ const checkBlocked = (req, res, next) => {
     next();
 };
 
-// Primary rate limiter: 3 requests per 5 minutes (per‑IP)
 const paymentLimiter = rateLimit({
-    windowMs: 5 * 60 * 1000, // 5 minutes
+    windowMs: 5 * 60 * 1000,
     max: 3,
     message: { error: "Too many payment requests from this IP. Please wait 5 minutes." },
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
-        // On rate limit violation, track it
         const ip = req.ip || req.connection.remoteAddress;
         const now = Date.now();
         const data = violationStore.get(ip) || { count: 0, firstViolationTime: now, blockUntil: null };
         data.count += 1;
-        if (data.count >= 3) { // after 3 violations within the hour
-            // Block for 1 hour
+        if (data.count >= 3) {
             data.blockUntil = now + 3600000;
             violationStore.set(ip, data);
             res.status(429).json({
@@ -203,7 +184,6 @@ const paymentLimiter = rateLimit({
     }
 });
 
-// 4. Per‑IP rate limit + blocking (after global rate limit)
 app.use('/api/pay', checkBlocked, paymentLimiter);
 app.use('/api/retry-payment', checkBlocked, paymentLimiter);
 
@@ -211,92 +191,63 @@ app.use('/api/retry-payment', checkBlocked, paymentLimiter);
    4. Root Route
 -------------------------------- */
 app.get("/", (req, res) => {
-    res.send("sarahapay API Running");
+    res.send("sarahapay API Running (Lipana)");
 });
 
 /* -------------------------------
-   5. OAuth Token
+   5. Lipana API Helper
 -------------------------------- */
-async function getAccessToken() {
-    try {
-        const credentials = Buffer
-            .from(`${process.env.CLIENT_ID}:${process.env.CLIENT_SECRET}`)
-            .toString("base64");
+const LIPANA_BASE = process.env.LIPANA_ENVIRONMENT === 'sandbox' 
+    ? 'https://api.lipana.dev/v1'  // they use same base for both
+    : 'https://api.lipana.dev/v1';
 
-        const response = await axios.post(
-            "https://api.kopokopo.com/oauth/token",
-            qs.stringify({ grant_type: "client_credentials" }),
-            {
-                headers: {
-                    Authorization: `Basic ${credentials}`,
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-                timeout: 10000
-            }
-        );
-
-        return response.data.access_token;
-    } catch (error) {
-        console.error("OAuth Failure:", error.response?.data || error.message);
-        throw new Error("Authentication failed");
-    }
-}
+const lipanaHeaders = {
+    'x-api-key': process.env.LIPANA_API_KEY,
+    'Content-Type': 'application/json'
+};
 
 /* -------------------------------
-   6. Helper: Initiate STK Push
+   6. Helper: Initiate STK Push (Lipana)
 -------------------------------- */
 async function initiateStkPush(name, phone, amount, retryCount = 0) {
+    // Normalize phone number (remove spaces, +, leading 0)
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
         .replace(/^0/, '254');
 
-    const names = name.trim().split(" ");
-    const firstName = names[0];
-    const lastName = names.slice(1).join(" ") || "Customer";
-
-    const token = await getAccessToken();
-    const formattedAmount = parseFloat(amount).toFixed(2);
+    // Ensure the phone is in +254 format (Lipana expects +254...)
+    if (!formattedPhone.startsWith('254')) {
+        formattedPhone = '254' + formattedPhone;
+    }
+    // Lipana's docs show both +254 and 254 work; we'll use +254 for safety
+    const phoneWithPlus = '+' + formattedPhone;
 
     const payload = {
-        payment_channel: "M-PESA STK Push",
-        till_number: process.env.MERCHANT_NUMBER,
-        subscriber: {
-            first_name: firstName,
-            last_name: lastName,
-            phone_number: formattedPhone,
-            email: "customer@example.com"
-        },
-        amount: {
-            currency: "KES",
-            value: formattedAmount
-        },
-        metadata: { notes: "Website Purchase" },
-        _links: { callback_url: process.env.CALLBACK_URL }
+        phone: phoneWithPlus,
+        amount: parseFloat(amount)
     };
 
-    console.log("STK Payload:", payload);
+    console.log("Lipana STK Payload:", payload);
 
     const response = await axios.post(
-        "https://api.kopokopo.com/api/v1/incoming_payments",
+        `${LIPANA_BASE}/transactions/push-stk`,
         payload,
         {
-            headers: {
-                Authorization: `Bearer ${token}`,
-                Accept: "application/json",
-                "Content-Type": "application/json"
-            },
+            headers: lipanaHeaders,
             timeout: 10000
         }
     );
 
-    const checkoutId = response.headers.location.split("/").pop();
+    // Lipana response: { success, message, data: { transactionId, status, checkoutRequestID, message } }
+    const { transactionId, checkoutRequestID } = response.data.data;
 
+    // Store checkoutRequestID as our checkout_id for reconciliation
     const tx = new Transaction({
         name,
         phone: formattedPhone,
-        amount: formattedAmount,
-        checkout_id: checkoutId,
+        amount: parseFloat(amount).toFixed(2),
+        checkout_id: checkoutRequestID || transactionId, // fallback
         retryCount: retryCount,
         lastRetryAt: new Date()
     });
@@ -306,7 +257,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 }
 
 /* -------------------------------
-   7. Initiate Payment (with 30‑second timeout & retry logic)
+   7. Initiate Payment (unchanged logic, uses Lipana)
 -------------------------------- */
 app.post("/api/pay", async (req, res) => {
     try {
@@ -372,7 +323,7 @@ app.post("/api/pay", async (req, res) => {
 });
 
 /* -------------------------------
-   8. Retry Payment Endpoint
+   8. Retry Payment Endpoint (unchanged logic)
 -------------------------------- */
 app.post("/api/retry-payment", async (req, res) => {
     try {
@@ -436,7 +387,7 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 /* -------------------------------
-   9. Fetch Transactions
+   9. Fetch Transactions (unchanged)
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -448,7 +399,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 /* -------------------------------
-   10. Get Single Transaction by ID
+   10. Get Single Transaction by ID (unchanged)
 -------------------------------- */
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -463,37 +414,83 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   11. Payment Callback
+   11. Payment Callback (Webhook) – Lipana version with signature verification
 -------------------------------- */
 app.post("/callback", async (req, res) => {
     try {
-        console.log("Callback received:", JSON.stringify(req.body, null, 2));
+        // Get raw body for signature verification
+        const rawBody = JSON.stringify(req.body);
+        const signature = req.headers['x-lipana-signature'];
 
-        if (!req.body || !req.body.data) {
-            console.log("Empty callback payload – ignoring");
+        if (!signature) {
+            console.log("Missing X-Lipana-Signature header");
+            return res.sendStatus(401);
+        }
+
+        // Verify signature (optional but recommended)
+        if (process.env.LIPANA_WEBHOOK_SECRET) {
+            const expectedSignature = crypto
+                .createHmac('sha256', process.env.LIPANA_WEBHOOK_SECRET)
+                .update(rawBody)
+                .digest('hex');
+
+            if (!crypto.timingSafeEqual(
+                Buffer.from(signature),
+                Buffer.from(expectedSignature)
+            )) {
+                console.log("Invalid webhook signature");
+                return res.sendStatus(401);
+            }
+        }
+
+        // Parse payload
+        const payload = req.body;
+        console.log("Callback received:", JSON.stringify(payload, null, 2));
+
+        // Check if it's a payment event
+        const event = payload.event;
+        const eventData = payload.data;
+
+        if (!event || !eventData) {
+            console.log("Invalid webhook structure – ignoring");
             return res.sendStatus(200);
         }
 
-        const payload = req.body.data;
-        const checkoutId = payload.id;
-        const status = payload.attributes?.status;
-        const receipt = payload.attributes?.event?.resource?.reference || "N/A";
+        // Extract transaction details – Lipana uses transactionId and checkoutRequestID
+        const transactionId = eventData.transactionId;
+        const checkoutRequestID = eventData.checkoutRequestID;
+        const status = eventData.status; // "success", "failed", "pending"
+        const amount = eventData.amount;
+        const phone = eventData.phone;
+
+        // Determine which ID to use (checkoutRequestID is more reliable)
+        const checkoutId = checkoutRequestID || transactionId;
 
         if (!checkoutId) {
-            console.log("Callback missing checkoutId – ignoring");
+            console.log("Callback missing transaction ID – ignoring");
             return res.sendStatus(200);
         }
 
-        await Transaction.findOneAndUpdate(
+        // Update transaction status
+        const updateResult = await Transaction.findOneAndUpdate(
             { checkout_id: checkoutId },
-            { status: status, mpesa_receipt: receipt }
+            {
+                status: status.toUpperCase(),
+                mpesa_receipt: transactionId || "N/A"
+            },
+            { new: true }
         );
 
-        console.log(`Payment Update: ${status} | Receipt: ${receipt}`);
+        if (updateResult) {
+            console.log(`Payment Update: ${status} | Receipt: ${transactionId}`);
+        } else {
+            console.log(`Transaction not found for checkout_id: ${checkoutId}`);
+        }
+
         res.sendStatus(200);
     } catch (error) {
         console.error("Callback Error:", error);
-        res.sendStatus(200);
+        res.sendStatus(200); // always 200 to prevent retries
     }
 });
 
