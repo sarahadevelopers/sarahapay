@@ -5,7 +5,6 @@ const axios = require('axios');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -18,14 +17,14 @@ mongoose.connect(process.env.MONGO_URI)
     .catch(err => console.error("MongoDB Error:", err));
 
 /* -------------------------------
-   2. Transaction Schema (unchanged)
+   2. Transaction Schema (with retry fields)
 -------------------------------- */
 const transactionSchema = new mongoose.Schema({
     name: String,
     phone: String,
     amount: String,
     status: { type: String, default: "PENDING" },
-    checkout_id: String,          // will store Lipana's checkoutRequestID or transactionId
+    checkout_id: String,
     mpesa_receipt: String,
     retryCount: { type: Number, default: 0 },
     lastRetryAt: { type: Date, default: null },
@@ -191,73 +190,68 @@ app.use('/api/retry-payment', checkBlocked, paymentLimiter);
    4. Root Route
 -------------------------------- */
 app.get("/", (req, res) => {
-    res.send("sarahapay API Running (Lipana)");
+    res.send("sarahapay API Running – Paywave Express");
 });
 
 /* -------------------------------
-   5. Lipana API Helper
--------------------------------- */
-const LIPANA_BASE = process.env.LIPANA_ENVIRONMENT === 'sandbox' 
-    ? 'https://api.lipana.dev/v1'  // they use same base for both
-    : 'https://api.lipana.dev/v1';
-
-const lipanaHeaders = {
-    'x-api-key': process.env.LIPANA_API_KEY,
-    'Content-Type': 'application/json'
-};
-
-/* -------------------------------
-   6. Helper: Initiate STK Push (Lipana)
+   5. Helper: Initiate STK Push (Paywave Express)
 -------------------------------- */
 async function initiateStkPush(name, phone, amount, retryCount = 0) {
-    // Normalize phone number (remove spaces, +, leading 0)
+    // Normalize phone number
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
         .replace(/^0/, '254');
 
-    // Ensure the phone is in +254 format (Lipana expects +254...)
+    // Paywave accepts phone in 254XXXXXXXXX format
     if (!formattedPhone.startsWith('254')) {
         formattedPhone = '254' + formattedPhone;
     }
-    // Lipana's docs show both +254 and 254 work; we'll use +254 for safety
-    const phoneWithPlus = '+' + formattedPhone;
 
     const payload = {
-        phone: phoneWithPlus,
-        amount: parseFloat(amount)
+        api_key: process.env.PAYWAVE_API_KEY,
+        email: process.env.PAYWAVE_EMAIL || 'codewithkaranja@gmail.com',
+        amount: parseFloat(amount).toFixed(2),
+        msisdn: formattedPhone,
+        reference: name || 'Payment via Sarahapay'
     };
 
-    console.log("Lipana STK Payload:", payload);
+    console.log("Paywave STK Payload:", payload);
 
     const response = await axios.post(
-        `${LIPANA_BASE}/transactions/push-stk`,
+        'https://paywavexpress.co.ke/v1/stkpush',
         payload,
         {
-            headers: lipanaHeaders,
-            timeout: 10000
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 15000
         }
     );
 
-    // Lipana response: { success, message, data: { transactionId, status, checkoutRequestID, message } }
-    const { transactionId, checkoutRequestID } = response.data.data;
+    console.log("Paywave Response:", response.data);
 
-    // Store checkoutRequestID as our checkout_id for reconciliation
-    const tx = new Transaction({
-        name,
-        phone: formattedPhone,
-        amount: parseFloat(amount).toFixed(2),
-        checkout_id: checkoutRequestID || transactionId, // fallback
-        retryCount: retryCount,
-        lastRetryAt: new Date()
-    });
+    const data = response.data;
 
-    await tx.save();
-    return tx;
+    // Check success – Paywave returns ResponseCode: '0' for success
+    if (data.ResponseCode === '0' || data.success === '200') {
+        const checkoutId = data.transactionId || data.TransactionID || 'paywave_' + Date.now();
+        const tx = new Transaction({
+            name: name || 'Paywave Payment',
+            phone: formattedPhone,
+            amount: parseFloat(amount).toFixed(2),
+            checkout_id: checkoutId,
+            retryCount: retryCount,
+            lastRetryAt: new Date()
+        });
+        await tx.save();
+        return tx;
+    } else {
+        const errorMsg = data.errorMessage || data.message || data.ResponseDescription || 'Paywave payment failed';
+        throw new Error(errorMsg);
+    }
 }
 
 /* -------------------------------
-   7. Initiate Payment (unchanged logic, uses Lipana)
+   6. Initiate Payment (with 30‑second timeout & retry logic)
 -------------------------------- */
 app.post("/api/pay", async (req, res) => {
     try {
@@ -323,7 +317,7 @@ app.post("/api/pay", async (req, res) => {
 });
 
 /* -------------------------------
-   8. Retry Payment Endpoint (unchanged logic)
+   7. Retry Payment Endpoint
 -------------------------------- */
 app.post("/api/retry-payment", async (req, res) => {
     try {
@@ -387,7 +381,7 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 /* -------------------------------
-   9. Fetch Transactions (unchanged)
+   8. Fetch Transactions
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -399,7 +393,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 /* -------------------------------
-   10. Get Single Transaction by ID (unchanged)
+   9. Get Single Transaction by ID
 -------------------------------- */
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -414,75 +408,60 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   11. Payment Callback (Webhook) – Lipana version with signature verification
+   10. Payment Callback (Webhook) – Paywave Express
 -------------------------------- */
 app.post("/callback", async (req, res) => {
     try {
-        // Get raw body for signature verification
-        const rawBody = JSON.stringify(req.body);
-        const signature = req.headers['x-lipana-signature'];
+        console.log("Callback received:", JSON.stringify(req.body, null, 2));
 
-        if (!signature) {
-            console.log("Missing X-Lipana-Signature header");
-            return res.sendStatus(401);
-        }
-
-        // Verify signature (optional but recommended)
-        if (process.env.LIPANA_WEBHOOK_SECRET) {
-            const expectedSignature = crypto
-                .createHmac('sha256', process.env.LIPANA_WEBHOOK_SECRET)
-                .update(rawBody)
-                .digest('hex');
-
-            if (!crypto.timingSafeEqual(
-                Buffer.from(signature),
-                Buffer.from(expectedSignature)
-            )) {
-                console.log("Invalid webhook signature");
-                return res.sendStatus(401);
-            }
-        }
-
-        // Parse payload
+        // Paywave may send different payload structures; we'll try to extract common fields.
         const payload = req.body;
-        console.log("Callback received:", JSON.stringify(payload, null, 2));
 
-        // Check if it's a payment event
-        const event = payload.event;
-        const eventData = payload.data;
+        // Try to find a transaction ID and status
+        let checkoutId = payload.transactionId || payload.TransactionID || payload.transaction_id || payload.checkoutRequestID;
+        let status = payload.status || payload.Status || payload.ResponseDescription;
+        let receipt = payload.receipt || payload.MpesaReceiptNumber || payload.transactionId;
 
-        if (!event || !eventData) {
-            console.log("Invalid webhook structure – ignoring");
-            return res.sendStatus(200);
+        // If no ID found, check if it's nested
+        if (!checkoutId && payload.data) {
+            const data = payload.data;
+            checkoutId = data.transactionId || data.TransactionID || data.transaction_id || data.checkoutRequestID;
+            status = data.status || data.Status;
+            receipt = data.receipt || data.MpesaReceiptNumber;
         }
-
-        // Extract transaction details – Lipana uses transactionId and checkoutRequestID
-        const transactionId = eventData.transactionId;
-        const checkoutRequestID = eventData.checkoutRequestID;
-        const status = eventData.status; // "success", "failed", "pending"
-        const amount = eventData.amount;
-        const phone = eventData.phone;
-
-        // Determine which ID to use (checkoutRequestID is more reliable)
-        const checkoutId = checkoutRequestID || transactionId;
 
         if (!checkoutId) {
             console.log("Callback missing transaction ID – ignoring");
             return res.sendStatus(200);
         }
 
-        // Update transaction status
+        // Normalize status to match our schema (uppercase)
+        if (status) {
+            status = status.toUpperCase();
+            // Map common statuses
+            if (status.includes('SUCCESS') || status.includes('COMPLETED')) {
+                status = 'SUCCESS';
+            } else if (status.includes('FAILED') || status.includes('CANCELLED') || status.includes('REVERSED') || status.includes('TIMEOUT')) {
+                status = 'FAILED';
+            } else {
+                status = status; // keep as is
+            }
+        } else {
+            status = 'PENDING';
+        }
+
+        // Update transaction
         const updateResult = await Transaction.findOneAndUpdate(
             { checkout_id: checkoutId },
             {
-                status: status.toUpperCase(),
-                mpesa_receipt: transactionId || "N/A"
+                status: status,
+                mpesa_receipt: receipt || 'N/A'
             },
             { new: true }
         );
 
         if (updateResult) {
-            console.log(`Payment Update: ${status} | Receipt: ${transactionId}`);
+            console.log(`Payment Update: ${status} | Receipt: ${receipt}`);
         } else {
             console.log(`Transaction not found for checkout_id: ${checkoutId}`);
         }
@@ -490,12 +469,12 @@ app.post("/callback", async (req, res) => {
         res.sendStatus(200);
     } catch (error) {
         console.error("Callback Error:", error);
-        res.sendStatus(200); // always 200 to prevent retries
+        res.sendStatus(200); // Always 200 to prevent retries
     }
 });
 
 /* -------------------------------
-   12. Start Server
+   11. Start Server
 -------------------------------- */
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
