@@ -73,8 +73,11 @@ const checkSecret = (req, res, next) => {
 };
 
 // ---------- reCAPTCHA VERIFICATION (for payment endpoints) ----------
+// Sarahapay server.js – UPDATE verifyRecaptcha
 const verifyRecaptcha = async (req, res, next) => {
-    const token = req.headers['x-recaptcha-token'];
+    // ✅ Check BOTH headers and body
+    const token = req.headers['x-recaptcha-token'] || req.body.recaptchaToken;
+    
     if (!token) {
         return res.status(400).json({ error: "Missing reCAPTCHA token" });
     }
