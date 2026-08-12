@@ -441,88 +441,103 @@ app.get("/api/transaction/:id", async (req, res) => {
 app.post("/callback", async (req, res) => {
     try {
         console.log("🔔 Callback received");
-        console.log("📋 Headers:", req.headers);
         console.log("📋 Body:", req.body);
         
-        // Get body from request
         let payload = req.body || {};
         
-        // If body is empty, try to parse raw body
-        if (!payload || Object.keys(payload).length === 0) {
-            if (req.rawBody) {
-                try {
-                    payload = JSON.parse(req.rawBody);
-                } catch (e) {
-                    console.log("❌ Failed to parse raw body as JSON");
-                    payload = { raw: req.rawBody };
-                }
-            }
-        }
+        // ─── Extract ALL possible transaction IDs ──────────────
+        const txIds = {
+            transactionId: payload.TransactionID || 
+                          payload.transactionId || 
+                          payload.transaction_request_id ||
+                          payload.checkout_id ||
+                          payload.CheckoutRequestID ||
+                          payload.MerchantRequestID,
+            checkoutId: payload.CheckoutRequestID || 
+                       payload.checkoutRequestID || 
+                       payload.transaction_request_id
+        };
         
-        console.log("📦 Payload:", JSON.stringify(payload, null, 2));
-
-        // ─── Get transaction ID ──────────────────────────────────────
-        let checkoutId = payload.TransactionID || 
-                        payload.transactionId || 
-                        payload.TransactionID ||
-                        payload.checkoutRequestID ||
-                        payload.CheckoutRequestID ||
-                        payload.transaction_request_id;
-
-        if (!checkoutId) {
-            console.log("❌ No transaction ID found in payload");
-            return res.sendStatus(200);
-        }
-
-        // ─── Get status ──────────────────────────────────────────────
-        let status = payload.ResponseDescription || 
-                    payload.status || 
-                    payload.message;
-
-        // Check for success (both ResponseCode and ResponseDescription)
+        console.log(`🔍 Looking for: ${txIds.transactionId} or ${txIds.checkoutId}`);
+        
+        // ─── Determine status ──────────────────────────────────
+        let status = 'PENDING';
         if (payload.ResponseCode === 0 || payload.ResponseCode === '0') {
             status = 'SUCCESS';
-        } else if (status && status.toLowerCase().includes('success')) {
+        } else if (payload.ResponseDescription && 
+                  payload.ResponseDescription.toLowerCase().includes('success')) {
             status = 'SUCCESS';
-        } else {
-            status = status || 'PENDING';
         }
-
-        // ─── Get receipt ─────────────────────────────────────────────
-        let receipt = payload.TransactionReceipt || 
-                     payload.receipt || 
-                     payload.MpesaReceiptNumber ||
-                     'N/A';
-
-        // Normalize status
-        let normalizedStatus = status.toUpperCase();
-        if (normalizedStatus.includes('SUCCESS')) {
-            normalizedStatus = 'SUCCESS';
-        } else if (normalizedStatus.includes('FAIL') || normalizedStatus.includes('CANCEL') || normalizedStatus.includes('TIMEOUT')) {
-            normalizedStatus = 'FAILED';
-        } else {
-            normalizedStatus = 'SUCCESS'; // ✅ Default to SUCCESS for Paywave
+        
+        const receipt = payload.TransactionReceipt || 
+                       payload.receipt || 
+                       'N/A';
+        
+        // ─── Search for the transaction ──────────────────────────
+        let result = null;
+        
+        // Try finding by transaction_request_id first
+        if (payload.transaction_request_id) {
+            result = await Transaction.findOne({ 
+                checkout_id: payload.transaction_request_id 
+            });
+            if (result) console.log(`✅ Found by transaction_request_id: ${payload.transaction_request_id}`);
         }
-
-        // ─── Update transaction ──────────────────────────────────────
-        const result = await Transaction.findOneAndUpdate(
-            { checkout_id: checkoutId },
-            { 
-                status: normalizedStatus, 
-                mpesa_receipt: receipt 
-            },
-            { new: true }
-        );
-
+        
+        // If not found, try by CheckoutRequestID
+        if (!result && payload.CheckoutRequestID) {
+            result = await Transaction.findOne({ 
+                checkout_id: payload.CheckoutRequestID 
+            });
+            if (result) console.log(`✅ Found by CheckoutRequestID: ${payload.CheckoutRequestID}`);
+        }
+        
+        // If not found, try by TransactionID
+        if (!result && payload.TransactionID) {
+            result = await Transaction.findOne({ 
+                checkout_id: payload.TransactionID 
+            });
+            if (result) console.log(`✅ Found by TransactionID: ${payload.TransactionID}`);
+        }
+        
+        // If still not found, try by any field
+        if (!result) {
+            result = await Transaction.findOne({
+                $or: [
+                    { checkout_id: payload.CheckoutRequestID || '' },
+                    { checkout_id: payload.TransactionID || '' },
+                    { checkout_id: payload.transaction_request_id || '' },
+                    { 'checkout_id': payload.CheckoutRequestID || '' },
+                    { transaction_request_id: payload.CheckoutRequestID || '' }
+                ]
+            });
+        }
+        
         if (result) {
-            console.log(`✅ Updated transaction ${checkoutId}: ${normalizedStatus} | Receipt: ${receipt}`);
+            console.log(`📝 Updating transaction ${result._id} to ${status}`);
+            result.status = status;
+            result.mpesa_receipt = receipt;
+            await result.save();
+            console.log(`✅ Transaction updated: ${result._id} -> ${status}`);
         } else {
-            console.log(`❌ Transaction not found for checkout_id: ${checkoutId}`);
+            console.log(`❌ No transaction found. Creating new one...`);
+            // Create a new transaction if not found
+            const newTx = new Transaction({
+                name: 'Paywave Payment',
+                phone: payload.Msisdn || 'Unknown',
+                amount: payload.TransactionAmount || '0',
+                checkout_id: payload.TransactionID || payload.transaction_request_id || 'unknown',
+                mpesa_receipt: receipt,
+                status: status,
+                createdAt: new Date()
+            });
+            await newTx.save();
+            console.log(`✅ Created new transaction for ${payload.TransactionID}`);
         }
-
+        
         res.sendStatus(200);
     } catch (error) {
-        console.error("❌ Callback Error:", error);
+        console.error("❌ Callback error:", error);
         res.sendStatus(200);
     }
 });
