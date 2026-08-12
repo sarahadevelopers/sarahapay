@@ -61,6 +61,27 @@ app.use(cors({
 }));
 
 app.use(express.json());
+// ─── Raw body parser for callbacks with non-JSON content-types ──
+app.use((req, res, next) => {
+    // Skip if already parsed as JSON
+    if (req.headers['content-type'] && req.headers['content-type'].includes('application/json')) {
+        return next();
+    }
+    let data = '';
+    req.on('data', chunk => { data += chunk; });
+    req.on('end', () => {
+        req.rawBody = data;
+        // Try to parse as JSON if it looks like JSON
+        try {
+            if (data.trim().startsWith('{') || data.trim().startsWith('[')) {
+                req.body = JSON.parse(data);
+            }
+        } catch (e) {
+            // Not JSON, leave req.body as is (or keep as raw string)
+        }
+        next();
+    });
+});
 app.use(express.static("docs"));
 
 // ---------- SHARED SECRET CHECK (for both payment endpoints) ----------
@@ -414,35 +435,56 @@ app.get("/api/transaction/:id", async (req, res) => {
 /* -------------------------------
    10. Payment Callback (Webhook) – Paywave Express
 -------------------------------- */
+/* -------------------------------
+   10. Payment Callback (Webhook) – Paywave Express
+-------------------------------- */
 app.post("/callback", async (req, res) => {
     try {
-        console.log("Callback received:", JSON.stringify(req.body, null, 2));
+        console.log("🔔 Callback received");
+        console.log("📋 Headers:", req.headers);
+        console.log("📋 Raw body from req.rawBody:", req.rawBody || 'N/A');
+        console.log("📋 Parsed body:", req.body || 'N/A');
 
-        // Paywave may send different payload structures; we'll try to extract common fields.
-        const payload = req.body;
+        // Use body from either req.body (if parsed) or req.rawBody
+        let payload = req.body;
 
-        // Try to find a transaction ID and status
-        let checkoutId = payload.transactionId || payload.TransactionID || payload.transaction_id || payload.checkoutRequestID;
+        // If body is empty or undefined, try to parse rawBody
+        if (!payload || Object.keys(payload).length === 0) {
+            if (req.rawBody) {
+                try {
+                    payload = JSON.parse(req.rawBody);
+                } catch (e) {
+                    console.error("Failed to parse raw body as JSON");
+                    payload = {};
+                }
+            } else {
+                payload = {};
+            }
+        }
+
+        console.log("📦 Final payload:", JSON.stringify(payload, null, 2));
+
+        // Try to find a transaction ID and status from various possible fields
+        let checkoutId = payload.transactionId || payload.TransactionID || payload.transaction_id || payload.checkoutRequestID || payload.CheckoutRequestID;
         let status = payload.status || payload.Status || payload.ResponseDescription;
-        let receipt = payload.receipt || payload.MpesaReceiptNumber || payload.transactionId;
+        let receipt = payload.receipt || payload.MpesaReceiptNumber || payload.transactionId || payload.TransactionID;
 
-        // If no ID found, check if it's nested
+        // If no ID found, check if it's nested in data
         if (!checkoutId && payload.data) {
             const data = payload.data;
-            checkoutId = data.transactionId || data.TransactionID || data.transaction_id || data.checkoutRequestID;
+            checkoutId = data.transactionId || data.TransactionID || data.transaction_id || data.checkoutRequestID || data.CheckoutRequestID;
             status = data.status || data.Status;
             receipt = data.receipt || data.MpesaReceiptNumber;
         }
 
         if (!checkoutId) {
-            console.log("Callback missing transaction ID – ignoring");
+            console.log("❌ Callback missing transaction ID – ignoring");
             return res.sendStatus(200);
         }
 
-        // Normalize status to match our schema (uppercase)
+        // Normalize status to uppercase
         if (status) {
             status = status.toUpperCase();
-            // Map common statuses
             if (status.includes('SUCCESS') || status.includes('COMPLETED')) {
                 status = 'SUCCESS';
             } else if (status.includes('FAILED') || status.includes('CANCELLED') || status.includes('REVERSED') || status.includes('TIMEOUT')) {
@@ -465,14 +507,14 @@ app.post("/callback", async (req, res) => {
         );
 
         if (updateResult) {
-            console.log(`Payment Update: ${status} | Receipt: ${receipt}`);
+            console.log(`✅ Payment Update: ${status} | Receipt: ${receipt}`);
         } else {
-            console.log(`Transaction not found for checkout_id: ${checkoutId}`);
+            console.log(`❌ Transaction not found for checkout_id: ${checkoutId}`);
         }
 
         res.sendStatus(200);
     } catch (error) {
-        console.error("Callback Error:", error);
+        console.error("❌ Callback Error:", error);
         res.sendStatus(200); // Always 200 to prevent retries
     }
 });
