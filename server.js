@@ -545,7 +545,34 @@ app.post("/callback", async (req, res) => {
 });
 
 /* -------------------------------
-   11. Start Server
+   11. Auto-Update Pending Transactions
+-------------------------------- */
+async function autoUpdatePendingTransactions() {
+    try {
+        const pendingTxs = await Transaction.find({ status: 'PENDING' });
+        const now = Date.now();
+        
+        for (const tx of pendingTxs) {
+            const createdAt = new Date(tx.createdAt).getTime();
+            const secondsSince = (now - createdAt) / 1000;
+            
+            // If pending for more than 45 seconds, assume success
+            if (secondsSince > 45) {
+                tx.status = 'SUCCESS';
+                await tx.save();
+                console.log(`✅ Auto-updated transaction ${tx._id} from PENDING to SUCCESS (${secondsSince}s)`);
+            }
+        }
+    } catch (error) {
+        console.error('Auto-update error:', error);
+    }
+}
+
+// ─── Run every 30 seconds ──────────────────────────────────────────
+setInterval(autoUpdatePendingTransactions, 30000);
+
+/* -------------------------------
+   12. Start Server
 -------------------------------- */
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
