@@ -151,8 +151,8 @@ const globalRateLimit = (req, res, next) => {
 // ---------- Apply middleware to payment endpoints ----------
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
-app.use('/api/pay', verifyRecaptcha);
-app.use('/api/retry-payment', verifyRecaptcha);
+//app.use('/api/pay', verifyRecaptcha);
+//app.use('/api/retry-payment', verifyRecaptcha);
 app.use('/api/pay', globalRateLimit);
 app.use('/api/retry-payment', globalRateLimit);
 
