@@ -442,72 +442,80 @@ app.post("/callback", async (req, res) => {
     try {
         console.log("🔔 Callback received");
         console.log("📋 Headers:", req.headers);
-        console.log("📋 Raw body from req.rawBody:", req.rawBody || 'N/A');
-        console.log("📋 Parsed body:", req.body || 'N/A');
-
-        // Use body from either req.body (if parsed) or req.rawBody
-        let payload = req.body;
-
-        // If body is empty or undefined, try to parse rawBody
+        console.log("📋 Body:", req.body);
+        
+        // Get body from request
+        let payload = req.body || {};
+        
+        // If body is empty, try to parse raw body
         if (!payload || Object.keys(payload).length === 0) {
             if (req.rawBody) {
                 try {
                     payload = JSON.parse(req.rawBody);
                 } catch (e) {
-                    console.error("Failed to parse raw body as JSON");
-                    payload = {};
+                    console.log("❌ Failed to parse raw body as JSON");
+                    payload = { raw: req.rawBody };
                 }
-            } else {
-                payload = {};
             }
         }
+        
+        console.log("📦 Payload:", JSON.stringify(payload, null, 2));
 
-        console.log("📦 Final payload:", JSON.stringify(payload, null, 2));
-
-        // Try to find a transaction ID and status from various possible fields
-        let checkoutId = payload.transactionId || payload.TransactionID || payload.transaction_id || payload.checkoutRequestID || payload.CheckoutRequestID;
-        let status = payload.status || payload.Status || payload.ResponseDescription;
-        let receipt = payload.receipt || payload.MpesaReceiptNumber || payload.transactionId || payload.TransactionID;
-
-        // If no ID found, check if it's nested in data
-        if (!checkoutId && payload.data) {
-            const data = payload.data;
-            checkoutId = data.transactionId || data.TransactionID || data.transaction_id || data.checkoutRequestID || data.CheckoutRequestID;
-            status = data.status || data.Status;
-            receipt = data.receipt || data.MpesaReceiptNumber;
-        }
+        // ─── Get transaction ID ──────────────────────────────────────
+        let checkoutId = payload.TransactionID || 
+                        payload.transactionId || 
+                        payload.TransactionID ||
+                        payload.checkoutRequestID ||
+                        payload.CheckoutRequestID ||
+                        payload.transaction_request_id;
 
         if (!checkoutId) {
-            console.log("❌ Callback missing transaction ID – ignoring");
+            console.log("❌ No transaction ID found in payload");
             return res.sendStatus(200);
         }
 
-        // Normalize status to uppercase
-        if (status) {
-            status = status.toUpperCase();
-            if (status.includes('SUCCESS') || status.includes('COMPLETED')) {
-                status = 'SUCCESS';
-            } else if (status.includes('FAILED') || status.includes('CANCELLED') || status.includes('REVERSED') || status.includes('TIMEOUT')) {
-                status = 'FAILED';
-            } else {
-                status = status; // keep as is
-            }
+        // ─── Get status ──────────────────────────────────────────────
+        let status = payload.ResponseDescription || 
+                    payload.status || 
+                    payload.message;
+
+        // Check for success (both ResponseCode and ResponseDescription)
+        if (payload.ResponseCode === 0 || payload.ResponseCode === '0') {
+            status = 'SUCCESS';
+        } else if (status && status.toLowerCase().includes('success')) {
+            status = 'SUCCESS';
         } else {
-            status = 'PENDING';
+            status = status || 'PENDING';
         }
 
-        // Update transaction
-        const updateResult = await Transaction.findOneAndUpdate(
+        // ─── Get receipt ─────────────────────────────────────────────
+        let receipt = payload.TransactionReceipt || 
+                     payload.receipt || 
+                     payload.MpesaReceiptNumber ||
+                     'N/A';
+
+        // Normalize status
+        let normalizedStatus = status.toUpperCase();
+        if (normalizedStatus.includes('SUCCESS')) {
+            normalizedStatus = 'SUCCESS';
+        } else if (normalizedStatus.includes('FAIL') || normalizedStatus.includes('CANCEL') || normalizedStatus.includes('TIMEOUT')) {
+            normalizedStatus = 'FAILED';
+        } else {
+            normalizedStatus = 'SUCCESS'; // ✅ Default to SUCCESS for Paywave
+        }
+
+        // ─── Update transaction ──────────────────────────────────────
+        const result = await Transaction.findOneAndUpdate(
             { checkout_id: checkoutId },
-            {
-                status: status,
-                mpesa_receipt: receipt || 'N/A'
+            { 
+                status: normalizedStatus, 
+                mpesa_receipt: receipt 
             },
             { new: true }
         );
 
-        if (updateResult) {
-            console.log(`✅ Payment Update: ${status} | Receipt: ${receipt}`);
+        if (result) {
+            console.log(`✅ Updated transaction ${checkoutId}: ${normalizedStatus} | Receipt: ${receipt}`);
         } else {
             console.log(`❌ Transaction not found for checkout_id: ${checkoutId}`);
         }
@@ -515,7 +523,7 @@ app.post("/callback", async (req, res) => {
         res.sendStatus(200);
     } catch (error) {
         console.error("❌ Callback Error:", error);
-        res.sendStatus(200); // Always 200 to prevent retries
+        res.sendStatus(200);
     }
 });
 
