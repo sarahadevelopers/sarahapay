@@ -258,21 +258,23 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 
     // Check success – Paywave returns ResponseCode: '0' for success
     if (data.ResponseCode === '0' || data.success === '200') {
-        const checkoutId = data.transactionId || data.TransactionID || 'paywave_' + Date.now();
-        const tx = new Transaction({
-            name: name || 'Paywave Payment',
-            phone: formattedPhone,
-            amount: parseFloat(amount).toFixed(2),
-            checkout_id: checkoutId,
-            retryCount: retryCount,
-            lastRetryAt: new Date()
-        });
-        await tx.save();
-        return tx;
-    } else {
-        const errorMsg = data.errorMessage || data.message || data.ResponseDescription || 'Paywave payment failed';
-        throw new Error(errorMsg);
-    }
+    // ✅ Use the Paywave transaction_request_id – this is what the callback sends!
+    const checkoutId = data.transaction_request_id || data.TransactionID || data.CheckoutRequestID || 'paywave_' + Date.now();
+    
+    const tx = new Transaction({
+        name: name || 'Paywave Payment',
+        phone: formattedPhone,
+        amount: parseFloat(amount).toFixed(2),
+        checkout_id: checkoutId,  // ✅ Now matches Paywave callback
+        retryCount: retryCount,
+        lastRetryAt: new Date()
+    });
+    await tx.save();
+    return tx;
+} else {
+    const errorMsg = data.errorMessage || data.message || data.ResponseDescription || 'Paywave payment failed';
+    throw new Error(errorMsg);
+}
 }
 
 /* -------------------------------
