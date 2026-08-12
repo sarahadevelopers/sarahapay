@@ -44,7 +44,8 @@ const allowedOrigins = [
     'https://fineescorts.co.ke',
     'https://www.fineescorts.co.ke',
     'https://sarahadevelopers.github.io',
-    'http://localhost:3000'
+    'http://localhost:3000',
+    'https://fine-2zxp.onrender.com'  // ✅ ADD THIS
 ];
 
 app.use(cors({
