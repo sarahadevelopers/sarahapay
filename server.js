@@ -45,7 +45,7 @@ const allowedOrigins = [
     'https://www.fineescorts.co.ke',
     'https://sarahadevelopers.github.io',
     'http://localhost:3000',
-    'https://fine-2zxp.onrender.com'  // ✅ ADD THIS
+    'https://fine-2zxp.onrender.com'
 ];
 
 app.use(cors({
@@ -63,7 +63,6 @@ app.use(cors({
 app.use(express.json());
 // ─── Raw body parser for callbacks with non-JSON content-types ──
 app.use((req, res, next) => {
-    // Skip if already parsed as JSON
     if (req.headers['content-type'] && req.headers['content-type'].includes('application/json')) {
         return next();
     }
@@ -71,20 +70,19 @@ app.use((req, res, next) => {
     req.on('data', chunk => { data += chunk; });
     req.on('end', () => {
         req.rawBody = data;
-        // Try to parse as JSON if it looks like JSON
         try {
             if (data.trim().startsWith('{') || data.trim().startsWith('[')) {
                 req.body = JSON.parse(data);
             }
         } catch (e) {
-            // Not JSON, leave req.body as is (or keep as raw string)
+            // Not JSON, leave as is
         }
         next();
     });
 });
 app.use(express.static("docs"));
 
-// ---------- SHARED SECRET CHECK (for both payment endpoints) ----------
+// ---------- SHARED SECRET CHECK ----------
 const checkSecret = (req, res, next) => {
     const secret = req.headers['x-api-secret'];
     if (secret !== process.env.API_SECRET) {
@@ -93,12 +91,9 @@ const checkSecret = (req, res, next) => {
     next();
 };
 
-// ---------- reCAPTCHA VERIFICATION (for payment endpoints) ----------
-// Sarahapay server.js – UPDATE verifyRecaptcha
+// ---------- reCAPTCHA VERIFICATION ----------
 const verifyRecaptcha = async (req, res, next) => {
-    // ✅ Check BOTH headers and body
     const token = req.headers['x-recaptcha-token'] || req.body.recaptchaToken;
-    
     if (!token) {
         return res.status(400).json({ error: "Missing reCAPTCHA token" });
     }
@@ -129,7 +124,7 @@ const verifyRecaptcha = async (req, res, next) => {
     }
 };
 
-// ---------- GLOBAL RATE LIMIT (all IPs combined) ----------
+// ---------- GLOBAL RATE LIMIT ----------
 let globalRequestCount = 0;
 let globalWindowStart = Date.now();
 const GLOBAL_MAX = 50;
@@ -148,15 +143,15 @@ const globalRateLimit = (req, res, next) => {
     next();
 };
 
-// ---------- Apply middleware to payment endpoints ----------
+// ---------- Apply middleware ----------
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
-//app.use('/api/pay', verifyRecaptcha);
-//app.use('/api/retry-payment', verifyRecaptcha);
+// app.use('/api/pay', verifyRecaptcha); // Uncomment for production
+// app.use('/api/retry-payment', verifyRecaptcha);
 app.use('/api/pay', globalRateLimit);
 app.use('/api/retry-payment', globalRateLimit);
 
-// ---------- RATE LIMITING & IP BLOCKING (per‑IP) ----------
+// ---------- IP BLOCKING ----------
 const violationStore = new Map();
 
 setInterval(() => {
@@ -228,7 +223,6 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         .replace(/^\+/, '')
         .replace(/^0/, '254');
 
-    // Paywave accepts phone in 254XXXXXXXXX format
     if (!formattedPhone.startsWith('254')) {
         formattedPhone = '254' + formattedPhone;
     }
@@ -258,27 +252,28 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 
     // Check success – Paywave returns ResponseCode: '0' for success
     if (data.ResponseCode === '0' || data.success === '200') {
-    // ✅ Use the Paywave transaction_request_id – this is what the callback sends!
-    const checkoutId = data.transaction_request_id || data.TransactionID || data.CheckoutRequestID || 'paywave_' + Date.now();
-    
-    const tx = new Transaction({
-        name: name || 'Paywave Payment',
-        phone: formattedPhone,
-        amount: parseFloat(amount).toFixed(2),
-        checkout_id: checkoutId,  // ✅ Now matches Paywave callback
-        retryCount: retryCount,
-        lastRetryAt: new Date()
-    });
-    await tx.save();
-    return tx;
-} else {
-    const errorMsg = data.errorMessage || data.message || data.ResponseDescription || 'Paywave payment failed';
-    throw new Error(errorMsg);
-}
+        // ✅ Use the CheckoutRequestID if available, else transaction_request_id
+        // This must match what the callback sends.
+        const checkoutId = data.CheckoutRequestID || data.transaction_request_id || data.TransactionID || 'paywave_' + Date.now();
+
+        const tx = new Transaction({
+            name: name || 'Paywave Payment',
+            phone: formattedPhone,
+            amount: parseFloat(amount).toFixed(2),
+            checkout_id: checkoutId,
+            retryCount: retryCount,
+            lastRetryAt: new Date()
+        });
+        await tx.save();
+        return tx;
+    } else {
+        const errorMsg = data.errorMessage || data.message || data.ResponseDescription || 'Paywave payment failed';
+        throw new Error(errorMsg);
+    }
 }
 
 /* -------------------------------
-   6. Initiate Payment (with 30‑second timeout & retry logic)
+   6. Initiate Payment
 -------------------------------- */
 app.post("/api/pay", async (req, res) => {
     try {
@@ -292,11 +287,10 @@ app.post("/api/pay", async (req, res) => {
             .replace(/^\+/, '')
             .replace(/^0/, '254');
 
-        // Find the most recent transaction for this phone
         const lastTx = await Transaction.findOne({ phone: formattedPhone })
             .sort({ createdAt: -1 });
 
-        // ---------- 30‑second timeout for pending transactions ----------
+        // 30‑second timeout for pending transactions
         if (lastTx && lastTx.status === "PENDING") {
             const secondsSince = (Date.now() - new Date(lastTx.createdAt).getTime()) / 1000;
             if (secondsSince > 30) {
@@ -312,7 +306,7 @@ app.post("/api/pay", async (req, res) => {
             }
         }
 
-        // ---------- Retry limit handling (max 5 attempts) ----------
+        // Retry limit handling (max 5 attempts)
         if (lastTx && (lastTx.status === "FAILED" || lastTx.status === "CANCELLED")) {
             const retryCount = lastTx.retryCount || 0;
             const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
@@ -435,111 +429,152 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   10. Payment Callback (Webhook) – Paywave Express
--------------------------------- */
-/* -------------------------------
-   10. Payment Callback (Webhook) – Paywave Express
+   10. Payment Callback (Webhook) – Improved
 -------------------------------- */
 app.post("/callback", async (req, res) => {
     try {
         console.log("🔔 Callback received");
-        console.log("📋 Body:", req.body);
-        
-        let payload = req.body || {};
-        
-        // ─── Extract ALL possible transaction IDs ──────────────
-        const txIds = {
-            transactionId: payload.TransactionID || 
-                          payload.transactionId || 
-                          payload.transaction_request_id ||
-                          payload.checkout_id ||
-                          payload.CheckoutRequestID ||
-                          payload.MerchantRequestID,
-            checkoutId: payload.CheckoutRequestID || 
-                       payload.checkoutRequestID || 
-                       payload.transaction_request_id
-        };
-        
-        console.log(`🔍 Looking for: ${txIds.transactionId} or ${txIds.checkoutId}`);
-        
+        console.log("📋 Body:", JSON.stringify(req.body, null, 2));
+
+        const payload = req.body || {};
+
+        // ─── Extract all possible IDs ──────────────────────────
+        const checkoutId = payload.CheckoutRequestID || payload.transaction_request_id || payload.checkout_id;
+        const transactionId = payload.TransactionID || payload.transactionId;
+        const merchantRequestId = payload.MerchantRequestID || payload.merchantRequestId;
+        const phone = payload.Msisdn || payload.phone;
+        const amount = payload.TransactionAmount || payload.amount;
+
+        console.log(`🔍 CheckoutRequestID: ${checkoutId}`);
+        console.log(`🔍 TransactionID: ${transactionId}`);
+        console.log(`🔍 MerchantRequestID: ${merchantRequestId}`);
+
         // ─── Determine status ──────────────────────────────────
         let status = 'PENDING';
         if (payload.ResponseCode === 0 || payload.ResponseCode === '0') {
             status = 'SUCCESS';
-        } else if (payload.ResponseDescription && 
+        } else if (payload.ResponseDescription &&
                   payload.ResponseDescription.toLowerCase().includes('success')) {
             status = 'SUCCESS';
         }
-        
-        const receipt = payload.TransactionReceipt || 
-                       payload.receipt || 
-                       'N/A';
-        
+
+        console.log(`📊 Status: ${status}`);
+
+        const receipt = payload.TransactionReceipt || payload.receipt || 'N/A';
+
         // ─── Search for the transaction ──────────────────────────
         let result = null;
-        
-        // Try finding by transaction_request_id first
-        if (payload.transaction_request_id) {
-            result = await Transaction.findOne({ 
-                checkout_id: payload.transaction_request_id 
-            });
-            if (result) console.log(`✅ Found by transaction_request_id: ${payload.transaction_request_id}`);
+
+        // 1️⃣ Try by CheckoutRequestID (most likely)
+        if (checkoutId) {
+            result = await Transaction.findOne({ checkout_id: checkoutId });
+            if (result) console.log(`✅ Found by CheckoutRequestID: ${checkoutId}`);
         }
-        
-        // If not found, try by CheckoutRequestID
-        if (!result && payload.CheckoutRequestID) {
-            result = await Transaction.findOne({ 
-                checkout_id: payload.CheckoutRequestID 
-            });
-            if (result) console.log(`✅ Found by CheckoutRequestID: ${payload.CheckoutRequestID}`);
+
+        // 2️⃣ Try by TransactionID
+        if (!result && transactionId) {
+            result = await Transaction.findOne({ checkout_id: transactionId });
+            if (result) console.log(`✅ Found by TransactionID: ${transactionId}`);
         }
-        
-        // If not found, try by TransactionID
-        if (!result && payload.TransactionID) {
-            result = await Transaction.findOne({ 
-                checkout_id: payload.TransactionID 
-            });
-            if (result) console.log(`✅ Found by TransactionID: ${payload.TransactionID}`);
+
+        // 3️⃣ Try by MerchantRequestID
+        if (!result && merchantRequestId) {
+            result = await Transaction.findOne({ checkout_id: merchantRequestId });
+            if (result) console.log(`✅ Found by MerchantRequestID: ${merchantRequestId}`);
         }
-        
-        // If still not found, try by any field
-        if (!result) {
+
+        // 4️⃣ Fallback: search by phone + amount (last resort)
+        if (!result && phone && amount) {
             result = await Transaction.findOne({
-                $or: [
-                    { checkout_id: payload.CheckoutRequestID || '' },
-                    { checkout_id: payload.TransactionID || '' },
-                    { checkout_id: payload.transaction_request_id || '' },
-                    { 'checkout_id': payload.CheckoutRequestID || '' },
-                    { transaction_request_id: payload.CheckoutRequestID || '' }
-                ]
-            });
+                phone: phone,
+                amount: String(amount)
+            }).sort({ createdAt: -1 });
+            if (result) console.log(`✅ Found by phone + amount: ${phone} / ${amount}`);
         }
-        
+
+        // 5️⃣ Broad search using any ID we have
+        if (!result) {
+            const searchFields = [checkoutId, transactionId, merchantRequestId].filter(Boolean);
+            if (searchFields.length > 0) {
+                result = await Transaction.findOne({
+                    $or: searchFields.map(id => ({ checkout_id: id }))
+                });
+                if (result) console.log(`✅ Found by broad search`);
+            }
+        }
+
         if (result) {
             console.log(`📝 Updating transaction ${result._id} to ${status}`);
             result.status = status;
             result.mpesa_receipt = receipt;
+            if (checkoutId && result.checkout_id !== checkoutId) {
+                result.checkout_id = checkoutId;
+            }
             await result.save();
             console.log(`✅ Transaction updated: ${result._id} -> ${status}`);
+
+            // ─── 👇 FORWARD CALLBACK TO FINESCORTS ──────────────────
+            try {
+                const axios = require('axios');
+                await axios.post('https://fineescorts.co.ke/payment-callback', {
+                    transactionId: result._id,
+                    checkoutId: result.checkout_id,
+                    status: status,
+                    receipt: receipt,
+                    phone: result.phone,
+                    amount: result.amount,
+                    name: result.name
+                }, {
+                    timeout: 5000,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                console.log('✅ Forwarded callback to FineEscorts');
+            } catch (forwardErr) {
+                console.error('❌ Failed to forward callback to FineEscorts:', forwardErr.message);
+                // Don't fail the main callback if forwarding fails
+            }
+            // ─── 👆 END OF FORWARDING ─────────────────────────────────
+
         } else {
             console.log(`❌ No transaction found. Creating new one...`);
-            // Create a new transaction if not found
             const newTx = new Transaction({
                 name: 'Paywave Payment',
-                phone: payload.Msisdn || 'Unknown',
-                amount: payload.TransactionAmount || '0',
-                checkout_id: payload.TransactionID || payload.transaction_request_id || 'unknown',
+                phone: phone || 'Unknown',
+                amount: String(amount || '0'),
+                checkout_id: checkoutId || transactionId || merchantRequestId || 'unknown',
                 mpesa_receipt: receipt,
                 status: status,
                 createdAt: new Date()
             });
             await newTx.save();
-            console.log(`✅ Created new transaction for ${payload.TransactionID}`);
+            console.log(`✅ Created new transaction for ${checkoutId || transactionId}`);
+
+            // ─── 👇 (Optional) Forward even for new transactions ──
+            try {
+                const axios = require('axios');
+                await axios.post('https://fineescorts.co.ke/payment-callback', {
+                    transactionId: newTx._id,
+                    checkoutId: newTx.checkout_id,
+                    status: status,
+                    receipt: receipt,
+                    phone: newTx.phone,
+                    amount: newTx.amount,
+                    name: newTx.name
+                }, {
+                    timeout: 5000,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                console.log('✅ Forwarded new transaction callback to FineEscorts');
+            } catch (forwardErr) {
+                console.error('❌ Failed to forward new transaction callback:', forwardErr.message);
+            }
+            // ─── 👆 END OF OPTIONAL FORWARDING ──────────────────────
         }
-        
+
         res.sendStatus(200);
     } catch (error) {
         console.error("❌ Callback error:", error);
+        // Always return 200 to acknowledge receipt (Paywave expects it)
         res.sendStatus(200);
     }
 });
@@ -551,11 +586,11 @@ async function autoUpdatePendingTransactions() {
     try {
         const pendingTxs = await Transaction.find({ status: 'PENDING' });
         const now = Date.now();
-        
+
         for (const tx of pendingTxs) {
             const createdAt = new Date(tx.createdAt).getTime();
             const secondsSince = (now - createdAt) / 1000;
-            
+
             // If pending for more than 45 seconds, assume success
             if (secondsSince > 45) {
                 tx.status = 'SUCCESS';
