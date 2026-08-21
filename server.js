@@ -66,11 +66,48 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static("docs"));
 
 // ---------- SHARED SECRET CHECK (only for /api/pay and /api/retry) ----------
+// ---------- SHARED SECRET CHECK (supports multiple sites) ----------
+// Add each site's secret as an environment variable:
+// API_SECRET – primary (RentSpace)
+// API_SECRET_BINGWA – Bingwa Soko
+// API_SECRET_FINEESCORTS – FineEscorts
+// etc.
+// ---------- SHARED SECRET CHECK (with domain exceptions) ----------
+const SKIP_SECRET_DOMAINS = [
+    'https://bingwasoko.co.ke',
+    'https://www.bingwasoko.co.ke',
+    'https://datasokoni.com',
+    'https://www.datasokoni.com'
+];
+
+const VALID_SECRETS = [
+    process.env.API_SECRET,                    // RentSpace & FineEscorts
+    process.env.API_SECRET_BINGWA,             // (optional)
+    process.env.API_SECRET_FINEESCORTS,        // (optional)
+].filter(Boolean);
+
 const checkSecret = (req, res, next) => {
+    const origin = req.headers.origin || req.headers.referer || '';
     const secret = req.headers['x-api-secret'];
-    if (secret !== process.env.API_SECRET) {
+
+    // ── Frontend-only domains → skip secret check ────────────────
+    const isTrustedDomain = SKIP_SECRET_DOMAINS.some(domain => origin.startsWith(domain));
+    if (isTrustedDomain) {
+        console.log(`✅ Skipping secret check for trusted domain: ${origin}`);
+        return next();
+    }
+
+    // ── All other sites → require valid secret ────────────────────
+    if (!secret) {
+        console.warn('❌ Missing API secret header');
+        return res.status(403).json({ error: "Missing API secret" });
+    }
+
+    if (!VALID_SECRETS.includes(secret)) {
+        console.warn(`❌ Invalid API secret: ${secret.substring(0, 10)}...`);
         return res.status(403).json({ error: "Unauthorized" });
     }
+
     next();
 };
 
