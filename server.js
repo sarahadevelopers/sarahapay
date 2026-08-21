@@ -426,114 +426,133 @@ app.post("/callback", async (req, res) => {
     console.log("📌 Body:", req.body);
     console.log("========================================");
 
-    // 1️⃣ If the body is empty or unparseable, abort immediately
+    // ── 1. Validate payload ──────────────────────────────────────
     if (!req.body || Object.keys(req.body).length === 0) {
         console.error("❌ Empty or unparseable callback payload");
-        return res.sendStatus(200);
+        return res.sendStatus(200); // Always ack
     }
 
     const payload = req.body;
 
-    // 2️⃣ Extract IDs (Paywave uses CheckoutRequestID)
+    // ── 2. Extract fields (Paywave uses various keys) ────────────
     const checkoutId = payload.CheckoutRequestID || payload.transaction_request_id || payload.checkout_id;
     const transactionId = payload.TransactionID || payload.transactionId;
     const merchantRequestId = payload.MerchantRequestID || payload.merchantRequestId;
     const phone = payload.Msisdn || payload.phone;
     const amount = payload.TransactionAmount || payload.amount;
+    const reference = payload.reference || payload.Reference || payload.transactionRef;
 
-    // 3️⃣ Determine status – ONLY from the callback response
+    // ── 3. Determine status ──────────────────────────────────────
     let status = 'FAILED';
     if (payload.ResponseCode === 0 || payload.ResponseCode === '0') {
         status = 'SUCCESS';
-    } else if (payload.ResponseDescription &&
-               payload.ResponseDescription.toLowerCase().includes('success')) {
+    } else if (payload.ResponseDescription && payload.ResponseDescription.toLowerCase().includes('success')) {
         status = 'SUCCESS';
     }
 
     console.log(`📊 Status from callback: ${status}`);
     const receipt = payload.TransactionReceipt || payload.receipt || 'N/A';
 
-    // 4️⃣ Search for the transaction in the database
-    let result = null;
+    // ── 4. Find the transaction in the database ──────────────────
+    let transaction = null;
 
-    // Try by CheckoutRequestID (most likely)
+    // Try by CheckoutRequestID (most common)
     if (checkoutId) {
-        result = await Transaction.findOne({ checkout_id: checkoutId });
-        if (result) console.log(`✅ Found by CheckoutRequestID: ${checkoutId}`);
+        transaction = await Transaction.findOne({ checkout_id: checkoutId });
+        if (transaction) console.log(`✅ Found by CheckoutRequestID: ${checkoutId}`);
     }
 
     // Try by TransactionID
-    if (!result && transactionId) {
-        result = await Transaction.findOne({ checkout_id: transactionId });
-        if (result) console.log(`✅ Found by TransactionID: ${transactionId}`);
+    if (!transaction && transactionId) {
+        transaction = await Transaction.findOne({ checkout_id: transactionId });
+        if (transaction) console.log(`✅ Found by TransactionID: ${transactionId}`);
     }
 
     // Try by MerchantRequestID
-    if (!result && merchantRequestId) {
-        result = await Transaction.findOne({ checkout_id: merchantRequestId });
-        if (result) console.log(`✅ Found by MerchantRequestID: ${merchantRequestId}`);
+    if (!transaction && merchantRequestId) {
+        transaction = await Transaction.findOne({ checkout_id: merchantRequestId });
+        if (transaction) console.log(`✅ Found by MerchantRequestID: ${merchantRequestId}`);
     }
 
-    // Fallback: search by phone + amount
-    if (!result && phone && amount) {
-        result = await Transaction.findOne({
+    // Fallback: phone + amount
+    if (!transaction && phone && amount) {
+        transaction = await Transaction.findOne({
             phone: phone,
             amount: String(amount)
         }).sort({ createdAt: -1 });
-        if (result) console.log(`✅ Found by phone + amount: ${phone} / ${amount}`);
+        if (transaction) console.log(`✅ Found by phone + amount: ${phone} / ${amount}`);
     }
 
-    // Broad search using any ID we have
-    if (!result) {
-        const searchFields = [checkoutId, transactionId, merchantRequestId].filter(Boolean);
-        if (searchFields.length > 0) {
-            result = await Transaction.findOne({
-                $or: searchFields.map(id => ({ checkout_id: id }))
+    // Broad search using any ID
+    if (!transaction) {
+        const ids = [checkoutId, transactionId, merchantRequestId].filter(Boolean);
+        if (ids.length > 0) {
+            transaction = await Transaction.findOne({
+                $or: ids.map(id => ({ checkout_id: id }))
             });
-            if (result) console.log(`✅ Found by broad search`);
+            if (transaction) console.log(`✅ Found by broad search`);
         }
     }
 
-    // 5️⃣ If no transaction is found, log and acknowledge (do NOT create a new one)
-    if (!result) {
+    // ── 5. If no transaction, acknowledge and stop ──────────────
+    if (!transaction) {
         console.error(`❌ No matching transaction found for checkoutId: ${checkoutId}`);
-        // Always return 200 to acknowledge receipt (Paywave expects it)
-        return res.sendStatus(200);
+        return res.sendStatus(200); // Always ack
     }
 
-    // 6️⃣ Update the transaction
-    console.log(`📝 Updating transaction ${result._id} to ${status}`);
-    result.status = status;
-    result.mpesa_receipt = receipt;
-    if (checkoutId && result.checkout_id !== checkoutId) {
-        result.checkout_id = checkoutId;
+    // ── 6. Update the transaction ─────────────────────────────────
+    console.log(`📝 Updating transaction ${transaction._id} to ${status}`);
+    transaction.status = status;
+    transaction.mpesa_receipt = receipt;
+    if (checkoutId && transaction.checkout_id !== checkoutId) {
+        transaction.checkout_id = checkoutId;
     }
-    await result.save();
-    console.log(`✅ Transaction updated: ${result._id} -> ${status}`);
+    await transaction.save();
+    console.log(`✅ Transaction updated: ${transaction._id} -> ${status}`);
 
-    // 7️⃣ Forward to FineEscorts (only if SUCCESS)
+    // ── 7. Forward to target systems (only on SUCCESS) ────────────
     if (status === 'SUCCESS') {
+        const callbackPayload = {
+            checkout_id: transaction.checkout_id || checkoutId,
+            status: 'paid',
+            mpesa_receipt: receipt,
+            amount: transaction.amount,
+            phone: transaction.phone,
+            name: transaction.name,
+            reference: reference || transaction._id.toString()
+        };
+
+        // ── Forward to FineEscorts ──────────────────────────────
         try {
-            const axios = require('axios');
             await axios.post(
                 'https://fineescorts.co.ke/payment-callback',
                 {
-                    transactionId: result._id,
-                    checkoutId: result.checkout_id,
+                    transactionId: transaction._id,
+                    checkoutId: transaction.checkout_id,
                     status: status,
                     receipt: receipt,
-                    phone: result.phone,
-                    amount: result.amount,
-                    name: result.name
+                    phone: transaction.phone,
+                    amount: transaction.amount,
+                    name: transaction.name
                 },
                 { timeout: 5000 }
             );
             console.log('✅ Forwarded callback to FineEscorts');
-        } catch (forwardErr) {
-            console.error('❌ Failed to forward callback to FineEscorts:', forwardErr.message);
+        } catch (err) {
+            console.error('❌ Failed to forward callback to FineEscorts:', err.message);
+        }
+
+        // ── Forward to RentSpace ──────────────────────────────────
+        const RENTSPACE_WEBHOOK_URL = process.env.RENTSPACE_WEBHOOK_URL || 'https://rentspace-markeplace.onrender.com/api/subscriptions/saraha-webhook';
+        try {
+            await axios.post(RENTSPACE_WEBHOOK_URL, callbackPayload, { timeout: 5000 });
+            console.log(`✅ Forwarded callback to RentSpace: ${RENTSPACE_WEBHOOK_URL}`);
+        } catch (err) {
+            console.error('❌ Failed to forward callback to RentSpace:', err.message);
         }
     }
 
+    // ── 8. Always return 200 OK to Paywave ────────────────────────
     res.sendStatus(200);
 });
 
